@@ -131,13 +131,26 @@ jobs:
           # CMAKE_SYSTEM_PROCESSOR from CMAKE_OSX_ARCHITECTURES, so it's
           # empty by default and that string() call fails with "no output
           # variable specified", cascading into FEX's own "Unsupported
-          # processor type" fatal error. build/fex-ios/build.sh doesn't
-          # pass -DCMAKE_SYSTEM_PROCESSOR, so inject it into the existing
-          # cmake invocation before delegating to the script (the script
-          # only runs cmake -S/-B when build-ios/CMakeCache.txt doesn't
-          # exist yet, so this sed is a no-op on cache hits).
+          # processor type" fatal error.
+          #
+          # Separately, TUNE_CPU defaults to "native" (line 170), which
+          # shells out to Scripts/aarch64_fit_native.py against the BUILD
+          # HOST's /proc/cpuinfo to autodetect an -mcpu value. /proc/cpuinfo
+          # doesn't exist on macOS at all, and the script also needs the
+          # `packaging` Python module which isn't guaranteed on the runner
+          # — either gap crashes the CMake configure (string(STRIP) with a
+          # missing second argument). None of this makes sense for a
+          # cross-compile targeting an iOS device anyway: TUNE_CPU=none is
+          # FEX's own documented opt-out (CMakeLists.txt line 530), which
+          # skips the whole autodetection path and adds no -mcpu flag.
+          #
+          # build/fex-ios/build.sh doesn't set either, so both are injected
+          # into its existing cmake invocation before delegating to it (the
+          # script only runs cmake -S/-B when build-ios/CMakeCache.txt
+          # doesn't exist yet, so this sed is a no-op on cache hits).
           sed -i.bak \
-            's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64/' \
+            -e 's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64/' \
+            -e 's/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON -DTUNE_CPU=none/' \
             build/fex-ios/build.sh
           bash build/fex-ios/build.sh
 
