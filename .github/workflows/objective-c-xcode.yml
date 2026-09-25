@@ -183,20 +183,38 @@ jobs:
           # -DCMAKE_CXX_STANDARD_REQUIRED=ON forces CMake to actually honor
           # C++20 (or fail configure loudly) instead of quietly compiling
           # wrong.
+          # Fourth: Core.cpp (and dozens of other files across FEXCore/Source/)
+          # gate iOS-specific code behind #ifdef FEX_IOS_HOST, but NO
+          # CMakeLists.txt in this repo ever defines that macro — confirmed by
+          # exhaustive grep, including checking whether FEX_IOS_HOST_BUILD (a
+          # differently-named CMake variable used only in the two
+          # Source/Windows/*/CMakeLists.txt arm64ec/mingw build files) is
+          # wired to it anywhere; it isn't. build/fex-ios/build.sh was never
+          # set up to enable this at all. Forcing it on via raw compiler
+          # flags (there's no add_compile_definitions/option() path for it)
+          # switches on a lot of code that reads as tightly coupled to the
+          # full Madeira app runtime — dual-mapped JIT memory offsets set by
+          # the host app, Mono-backpatcher bridge symbols defined in other
+          # translation units, iOS TEB/x18 handling — not something
+          # build/fex-ios/build.sh's isolated FEXCore-only build obviously
+          # provides. This is done at the person's explicit direction after
+          # flagging the risk; if link or runtime errors follow from missing
+          # counterpart symbols (e.g. ios_fex_mono_*, IosXpFex, defined in
+          # FEX/Source/Windows/ARM64EC/ which this build doesn't compile),
+          # that's this gap surfacing, not a new bug.
           sed -i.bak \
-            -e 's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_CXX_STANDARD_REQUIRED=ON/' \
+            -e 's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DCMAKE_C_FLAGS=-DFEX_IOS_HOST/' \
             -e 's/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON -DTUNE_CPU=none/' \
             build/fex-ios/build.sh
           # build/fex-ios/build.sh only reconfigures when
-          # FEX/build-ios/CMakeCache.txt is absent. A cache restore from a
-          # run before CMAKE_CXX_STANDARD_REQUIRED was added would carry a
-          # stale cache with none of today's -D flags applied, and the
-          # script would silently skip reconfiguring and reuse it. Force a
-          # fresh configure whenever the flags this step injects aren't
-          # already present in the restored cache.
+          # FEX/build-ios/CMakeCache.txt is absent. A cache restored from a
+          # run before FEX_IOS_HOST was added would carry none of today's
+          # flags, and the script would silently skip reconfiguring and
+          # reuse it. Force a fresh configure whenever the flags this step
+          # injects aren't already present in the restored cache.
           if [ -f FEX/build-ios/CMakeCache.txt ] && \
-             ! grep -q CMAKE_CXX_STANDARD_REQUIRED FEX/build-ios/CMakeCache.txt; then
-            echo "Stale FEX cache from before CMAKE_CXX_STANDARD_REQUIRED was added — forcing reconfigure"
+             ! grep -q FEX_IOS_HOST FEX/build-ios/CMakeCache.txt; then
+            echo "Stale FEX cache from before FEX_IOS_HOST was added — forcing reconfigure"
             rm -rf FEX/build-ios
           fi
           bash build/fex-ios/build.sh
