@@ -148,10 +148,33 @@ jobs:
           # into its existing cmake invocation before delegating to it (the
           # script only runs cmake -S/-B when build-ios/CMakeCache.txt
           # doesn't exist yet, so this sed is a no-op on cache hits).
+          # Third: FEXCore's SpinWaitLock.h uses std::atomic_ref (C++20).
+          # CMakeLists.txt sets CMAKE_CXX_STANDARD 20 (line 199) but never
+          # sets CMAKE_CXX_STANDARD_REQUIRED, so it's only a hint CMake can
+          # silently downgrade from — and for a cross-compile toolchain
+          # (CMAKE_CROSSCOMPILING=1 here; note "Check for working CXX
+          # compiler ... skipped" above) CMake's standard-detection is
+          # exactly where that silent fallback happens, landing effectively
+          # on C++11/14/17 and making std::atomic_ref invisible. Passing
+          # -DCMAKE_CXX_STANDARD_REQUIRED=ON forces CMake to actually honor
+          # C++20 (or fail configure loudly) instead of quietly compiling
+          # wrong.
           sed -i.bak \
-            -e 's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64/' \
+            -e 's/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0/-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_CXX_STANDARD_REQUIRED=ON/' \
             -e 's/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON/-DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON -DTUNE_CPU=none/' \
             build/fex-ios/build.sh
+          # build/fex-ios/build.sh only reconfigures when
+          # FEX/build-ios/CMakeCache.txt is absent. A cache restore from a
+          # run before CMAKE_CXX_STANDARD_REQUIRED was added would carry a
+          # stale cache with none of today's -D flags applied, and the
+          # script would silently skip reconfiguring and reuse it. Force a
+          # fresh configure whenever the flags this step injects aren't
+          # already present in the restored cache.
+          if [ -f FEX/build-ios/CMakeCache.txt ] && \
+             ! grep -q CMAKE_CXX_STANDARD_REQUIRED FEX/build-ios/CMakeCache.txt; then
+            echo "Stale FEX cache from before CMAKE_CXX_STANDARD_REQUIRED was added — forcing reconfigure"
+            rm -rf FEX/build-ios
+          fi
           bash build/fex-ios/build.sh
 
       # ------------------------------------------------------------------
