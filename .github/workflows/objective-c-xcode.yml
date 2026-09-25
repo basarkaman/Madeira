@@ -98,8 +98,32 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          # Apple Clang 16.0.0.16000026 (the default on this runner as of
+          # the last CI run) does not have std::atomic_ref in its bundled
+          # libc++ — it errors "no member named 'atomic_ref' in namespace
+          # 'std'" compiling FEXCore/Source/Utils/SpinWaitLock.cpp, which is
+          # a missing declaration, not a -std=/deployment-target issue (an
+          # earlier attempt to fix this via -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          # made no difference, confirming that). std::atomic_ref landed in
+          # upstream libc++ after the llvm 18.1.8 tag (May 2024); Apple
+          # ships its own libc++ snapshot per Xcode release, not upstream
+          # HEAD, so the fix is a newer bundled toolchain, not a compile
+          # flag. macos-15 runners include several Xcode versions
+          # (actions/runner-images macos-15-Readme.md lists 16.2 and 16.4
+          # alongside the default) — select the newest available one here
+          # rather than hardcoding a specific Xcode_NN.app path, since that
+          # path isn't guaranteed and an unverified hardcoded version
+          # was the mistake in the first version of this step.
+          ls /Applications | grep -i '^Xcode' || true
+          LATEST_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$LATEST_XCODE" ]; then
+            echo "::error::No /Applications/Xcode_*.app found on this runner"
+            exit 1
+          fi
+          echo "Selecting $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
           xcodebuild -version
+          clang --version
 
       - name: Cache native build outputs
         uses: actions/cache@v4
@@ -325,7 +349,7 @@ jobs:
   #   steps:
   #     - uses: actions/checkout@v4
   #     - name: Select Xcode
-  #       run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+  #       run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)/Contents/Developer"
   #     - name: Import signing certificate & provisioning profile
   #       env:
   #         BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
