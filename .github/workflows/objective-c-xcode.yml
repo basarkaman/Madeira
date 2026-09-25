@@ -1,0 +1,319 @@
+name: Xcode Build
+
+# Best-effort native build + unsigned IPA for Madeira.
+#
+# WHAT THIS DOES AND DOES NOT REBUILD
+# ------------------------------------
+# app/Madeira.xcodeproj links directly against build outputs that live
+# outside the app/ tree (../FEX/build-ios/**/*.a, wine's unix libs, DXMT's
+# libdxmt_unix.a, mingw-built PE binaries under app/Madeira/arm64ec-windows
+# and app/Madeira/aarch64-windows). Those come from `build/*/build.sh`
+# scripts spread across several independent chains. This workflow rebuilds
+# every chain that only needs public sources:
+#
+#   1. FEX (build/fex-ios/build.sh)        - CMake, self-contained, needs
+#                                             the FEX submodule only.
+#   2. GnuTLS/GMP/Nettle (build/gnutls-ios/build.sh) - autotools
+#                                             cross-compile, self-contained.
+#   3. freetype (build/freetype-ios/build.sh) - needs a shallow clone of
+#                                             upstream freetype (the script
+#                                             documents the exact clone
+#                                             command; done below).
+#   4. wine unix-side libs (build/ntdll-unix, build/win32u-unix,
+#      build/wineserver, build/crypto-unix) - needs the wine submodule
+#      configured as `wine/build-macos`. wineserver's script in particular
+#      PATCHES the libwineserver.a already committed in app/Madeira/ rather
+#      than building one from scratch (there is no from-scratch path for
+#      it in this repo) — this workflow starts from the checked-out repo's
+#      committed .a, same as the scripts expect.
+#
+# Two chains CANNOT be rebuilt in CI because they depend on artifacts that
+# are not fetchable from a public URL and are deliberately excluded from
+# this repo:
+#
+#   - build/fex-arm64ec, build/x64-tests, build/net-tests, build/proc-tests,
+#     and DXMT's PE/winemetal pieces all need
+#     toolchains/llvm-mingw-20260421-ucrt-macos-universal, a pinned custom
+#     mingw-w64/LLVM build that only exists on the maintainer's machine.
+#   - build/madeira-d3d12 needs Apple's proprietary Metal Shader Converter
+#     .pkg. build/madeira-d3d12/deps.sh refuses to run without it and says
+#     outright it is "deliberately not vendored" (unclear redistribution
+#     terms) — this cannot legally or practically be fetched in CI.
+#
+# For those two, this workflow does NOT attempt a rebuild — it leaves the
+# already-committed binaries in app/Madeira/ (arm64ec-windows, d3d12/,
+# libdxmt_unix.a) untouched and builds the app against them, same as the
+# "app-only" version of this workflow did. If those binaries are ever
+# removed from the repo, this workflow will fail at the xcodebuild step
+# with missing-file linker errors, not silently produce a broken app.
+#
+# CAVEAT: the wine/build-macos configure step (#4) uses standard Wine
+# cross-build flags inferred from how build/*-unix/build.sh reference
+# $WINE_SRC/build-macos — it is NOT copied from a documented command in
+# this repo (none exists) and may need adjusting against the actual
+# `wine` fork's configure.ac/autogen.sh if it errors.
+#
+# SIGNING
+# -------
+# Code signing is disabled for CI (CODE_SIGNING_ALLOWED=NO) since runners
+# don't have this project's signing certificate or provisioning profile
+# (DEVELOPMENT_TEAM = V8NU3FX3TL in project.pbxproj). The build targets a
+# real device (generic/platform=iOS, arm64) and the resulting .app is zipped
+# into an UNSIGNED .ipa artifact. It cannot be installed as-is — sign it
+# locally afterward (AltStore, SideStore, altsign, Sideloadly, etc.) before
+# installing on a device. See the commented "Archive & export" job below if
+# you'd rather have CI itself produce a signed, install-ready IPA.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/xcode-build.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/xcode-build.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: xcode-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA (device)
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # research/dxmt is cloned too even though its buildable pieces
+          # are skipped below, since app/source.json-adjacent tooling may
+          # reference it and it's needed if you extend this workflow later.
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Cache native build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            FEX/build-ios
+            wine/build-macos
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            build/freetype-ios/build
+            research/freetype
+            build/ntdll-unix/obj
+            build/win32u-unix/obj
+            build/wineserver/obj
+          key: madeira-native-${{ runner.os }}-${{ hashFiles('FEX/**', 'wine/**', 'build/**/*.sh', 'build/**/*.c', 'build/**/*.h') }}
+          restore-keys: |
+            madeira-native-${{ runner.os }}-
+
+      # ------------------------------------------------------------------
+      # Chain 1: FEX (self-contained CMake build)
+      # ------------------------------------------------------------------
+      - name: Build FEX
+        run: |
+          set -eux
+          brew list ninja &>/dev/null || brew install ninja
+          bash build/fex-ios/build.sh
+
+      # ------------------------------------------------------------------
+      # Chain 2: GnuTLS stack (self-contained autotools cross-compile)
+      # ------------------------------------------------------------------
+      - name: Build GnuTLS/GMP/Nettle
+        run: |
+          set -eux
+          bash build/gnutls-ios/build.sh
+
+      # ------------------------------------------------------------------
+      # Chain 3: freetype (needs a plain upstream clone first, as the
+      # script's own header comment documents)
+      # ------------------------------------------------------------------
+      - name: Clone freetype source
+        run: |
+          set -eux
+          if [ ! -d research/freetype ]; then
+            git clone --depth 1 --branch VER-2-13-3 \
+              https://github.com/freetype/freetype.git research/freetype
+          fi
+
+      - name: Build freetype
+        run: |
+          set -eux
+          bash build/freetype-ios/build.sh
+
+      # ------------------------------------------------------------------
+      # Chain 4: Wine unix-side libs. Needs wine/build-macos configured.
+      # See the CAVEAT note at the top of this file — this configure
+      # invocation is inferred, not documented in the repo.
+      # ------------------------------------------------------------------
+      - name: Configure wine/build-macos
+        run: |
+          set -eux
+          cd wine
+          if [ ! -f build-macos/config.log ]; then
+            ./tools/make_requests 2>/dev/null || true
+            autoreconf -fi
+            mkdir -p build-macos
+            cd build-macos
+            ../configure --host=aarch64-apple-darwin --disable-tests \
+              --without-x --without-freetype --without-vulkan \
+              CC="$(xcrun -f clang)" \
+              CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=17.0"
+          fi
+
+      - name: Build ntdll-unix (incl. crypto-unix)
+        run: |
+          set -eux
+          bash build/ntdll-unix/build.sh
+
+      - name: Build win32u-unix
+        run: |
+          set -eux
+          bash build/win32u-unix/build.sh
+
+      - name: Patch wineserver (libwineserver.a already in app/Madeira/)
+        run: |
+          set -eux
+          bash build/wineserver/build.sh all
+
+      - name: Refresh bundled licence texts
+        run: |
+          set -eux
+          bash build/stage-licenses.sh
+
+      # ------------------------------------------------------------------
+      # NOT rebuilt (see header comment): FEX arm64ec, DXMT PE/winemetal
+      # side, mingw-only test PEs, and madeira-d3d12. The binaries already
+      # committed in app/Madeira/ (arm64ec-windows/, aarch64-windows/,
+      # d3d12/, libdxmt_unix.a) are used as-is.
+      # ------------------------------------------------------------------
+
+      - name: Show available destinations
+        run: |
+          xcodebuild -project app/Madeira.xcodeproj \
+                     -target Madeira \
+                     -showdestinations
+
+      - name: Install xcbeautify
+        run: brew list xcbeautify &>/dev/null || brew install xcbeautify
+
+      - name: Build for iOS device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions
+
+      - name: Package unsigned .ipa
+        run: |
+          set -eu
+          APP_PATH="$(find DerivedData/Build/Products -maxdepth 2 -iname 'Madeira.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Madeira.app not found under DerivedData/Build/Products"
+            exit 1
+          fi
+          echo "Found app bundle: $APP_PATH"
+
+          PACKAGE_DIR="ipa-build/Payload"
+          mkdir -p "$PACKAGE_DIR"
+          cp -R "$APP_PATH" "$PACKAGE_DIR/"
+
+          cd ipa-build
+          zip -qr "../Madeira-unsigned.ipa" Payload
+          cd ..
+          echo "Built: Madeira-unsigned.ipa"
+          unzip -l Madeira-unsigned.ipa | head -20
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-ipa
+          path: Madeira-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: DerivedData/Logs/Build/*.xcactivitylog
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------
+  # Optional: real device build / archive with signing.
+  # Uncomment and configure once signing secrets are set up
+  # (Settings -> Secrets and variables -> Actions):
+  #   BUILD_CERTIFICATE_BASE64      - .p12 export of the distribution cert
+  #   P12_PASSWORD                  - password for the .p12
+  #   BUILD_PROVISION_PROFILE_BASE64 - .mobileprovision, base64-encoded
+  #   KEYCHAIN_PASSWORD             - any throwaway password for the CI keychain
+  #
+  # archive:
+  #   name: Archive (signed, device)
+  #   runs-on: macos-15
+  #   needs: build
+  #   if: github.event_name == 'workflow_dispatch'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Select Xcode
+  #       run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+  #     - name: Import signing certificate & provisioning profile
+  #       env:
+  #         BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+  #         P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+  #         BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+  #         KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+  #       run: |
+  #         CERT_PATH=$RUNNER_TEMP/cert.p12
+  #         PROFILE_PATH=$RUNNER_TEMP/profile.mobileprovision
+  #         KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+  #
+  #         echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+  #         echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o "$PROFILE_PATH"
+  #
+  #         security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+  #         security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+  #         security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+  #         security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+  #         security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+  #         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+  #
+  #         mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+  #         cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+  #     - name: Archive
+  #       run: |
+  #         xcodebuild archive \
+  #           -project app/Madeira.xcodeproj \
+  #           -scheme Madeira \
+  #           -configuration Release \
+  #           -archivePath DerivedData/Madeira.xcarchive \
+  #           -destination "generic/platform=iOS"
+  #     - name: Export IPA
+  #       run: |
+  #         xcodebuild -exportArchive \
+  #           -archivePath DerivedData/Madeira.xcarchive \
+  #           -exportPath DerivedData/export \
+  #           -exportOptionsPlist ExportOptions.plist   # add this file to the repo
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: Madeira-ipa
+  #         path: DerivedData/export/*.ipa
